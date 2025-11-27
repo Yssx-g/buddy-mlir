@@ -666,6 +666,7 @@ def convert_element_type_op(node: ConvertElementTypeOp, symbol_table):
         TensorDType.Float64: ir.F64Type.get(),
         TensorDType.Float32: ir.F32Type.get(),
         TensorDType.Float16: ir.F16Type.get(),
+        TensorDType.BFloat16: ir.BF16Type.get(),
         TensorDType.Int64: ir.IntegerType.get_signless(64),
         TensorDType.Int32: ir.IntegerType.get_signless(32),
         TensorDType.Bool: ir.IntegerType.get_signless(1),
@@ -1030,6 +1031,8 @@ def expand_op(node: ExpandOp, symbol_table) -> ir.Operation:
     elif result_element_type == ir.F32Type.get():
         element = ir.FloatAttr.get(result_element_type, 0.0)
     elif result_element_type == ir.F16Type.get():
+        element = ir.FloatAttr.get(result_element_type, 0.0)
+    elif result_element_type == ir.BF16Type.get():
         element = ir.FloatAttr.get(result_element_type, 0.0)
     else:
         raise NotImplementedError("Unsupported element type!")
@@ -1778,7 +1781,8 @@ def scaled_dot_product_flash_attention_for_cpu_op(
             minus_inf_tensor = arith.ConstantOp(
                 attn_mask.type,
                 ir.DenseElementsAttr.get_splat(
-                    attn_mask.type, ir.FloatAttr.get(f32_type, float("-inf"))
+                    attn_mask.type,
+                    ir.FloatAttr.get(ir.F32Type.get(), float("-inf")),
                 ),
             )
             attn_bias = tensor.SelectOp(attn_mask, minus_inf_tensor, attn_bias)
@@ -1789,23 +1793,6 @@ def scaled_dot_product_flash_attention_for_cpu_op(
                     memoryview(array.array("i", attn_bias.result.type.shape)),
                 )
             attn_bias = tosa.AddOp(attn_bias.result.type, attn_bias, attn_mask)
-
-    # Transpose key tensor
-    key_shape = list(key.type.shape)
-    perm_list = list(range(len(key_shape)))
-    perm_list[-1], perm_list[-2] = perm_list[-2], perm_list[-1]
-    perm_const_op = tosa.ConstOp(
-        ir.DenseElementsAttr.get(memoryview(array.array("i", perm_list)))
-    )
-    perm_shape = []
-    perm_shape.append(key_shape[0])
-    perm_shape.append(key_shape[1])
-    perm_shape.append(key_shape[3])
-    perm_shape.append(key_shape[2])
-    permute_result_type = ir.RankedTensorType.get(perm_shape, mlir_dtype)
-    key = tosa.TransposeOp(
-        permute_result_type, key, perm_const_op.results[0]
-    ).result
 
     # Matrix multiplication of query and key
     query_reshape_op = tosa.ReshapeOp(
@@ -1825,7 +1812,7 @@ def scaled_dot_product_flash_attention_for_cpu_op(
         key,
         memoryview(
             array.array(
-                "i", [key_shape[0] * key_shape[1], key_shape[3], key_shape[2]]
+                "i", [key_shape[0] * key_shape[1], key_shape[2], key_shape[3]]
             )
         ),
     )
@@ -1835,8 +1822,13 @@ def scaled_dot_product_flash_attention_for_cpu_op(
         key_shape[2],
     ]
     matmul_result_type = ir.RankedTensorType.get(matmul_result_shp, mlir_dtype)
-    matmul_op = tosa.MatMulOp(
-        matmul_result_type, query_reshape_op.result, key_reshape_op.result
+    element = mlir_element_attr_get(dtype, 0.0)
+    attr = ir.DenseElementsAttr.get_splat(matmul_result_type, element)
+    matmul_result_buffer = arith.ConstantOp(matmul_result_type, attr).result
+    matmul_op = linalg.batch_matmul_transpose_b(
+        query_reshape_op.result,
+        key_reshape_op.result,
+        outs=[matmul_result_buffer],
     )
     if mlir_dtype == ir.F16Type.get():
         f16_max_val = 65504.0
@@ -1849,6 +1841,27 @@ def scaled_dot_product_flash_attention_for_cpu_op(
         )
         min_fp_attr = ir.FloatAttr.get(ir.F32Type.get(), f16_min_val)
         max_fp_attr = ir.FloatAttr.get(ir.F32Type.get(), f16_max_val)
+
+        matmul_op = tosa.ClampOp(
+            matmul_op.type,
+            matmul_op,
+            min_int_attr,
+            max_int_attr,
+            min_fp_attr,
+            max_fp_attr,
+        )
+    elif mlir_dtype == ir.BF16Type.get():
+        # BF16 has the same range as F32 but lower precision
+        bf16_max_val = 3.4028235e38
+        bf16_min_val = -3.4028235e38
+        min_int_attr = ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(64), -sys.maxsize
+        )
+        max_int_attr = ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(64), sys.maxsize
+        )
+        min_fp_attr = ir.FloatAttr.get(ir.F32Type.get(), bf16_min_val)
+        max_fp_attr = ir.FloatAttr.get(ir.F32Type.get(), bf16_max_val)
 
         matmul_op = tosa.ClampOp(
             matmul_op.result.type,
@@ -2046,6 +2059,9 @@ def bitwise_and_tensor_op(node: BitwiseAndTensorOp, symbol_table):
     op = arith.AndIOp(input1, input2)
     return op
 
+
+# Import func ops registry for CallOp support
+from . import func as func_ops
 
 ops_registry = {
     "AddOp": add_op,
